@@ -187,7 +187,7 @@ def print_top_functions(weighted_functions, n):
     print("  n   Score     Function VA")
     for n, v in enumerate(sorted(weighted_functions.items(), key=operator.itemgetter(1), reverse=True)[:n], 1):
         fva, score = v
-        print("%3d %10.05f  0x%08X " % (n, score, fva))
+        print("%3d   %.05f   0x%08X " % (n, score, fva))
 
 
 if __name__ == "__main__":
