@@ -52,6 +52,7 @@ def get_xrefs_to(functions):
 
 
 def find_unusual_xors(functions):
+    # TODO find xors in tight loops
     candidate_functions = []
     for fva in functions:
         cva = fva
@@ -94,36 +95,66 @@ def is_security_cookie(va, ph, nh):
 
 def find_shifts(functions):
     candidate_functions = {}
+    # TODO better to compare number of shifts to overall instruction count?
+    # TODO find shifts in tight loops
     shift_mnems = set(["shl", "shr", "sar", "sal", "rol", "ror"])
     shift_mnems_len = len(shift_mnems)
     for fva in functions:
-        shift_count = 0
+        found_shifts = set([])
         cva = fva
         while cva != idaapi.BADADDR and cva < idc.FindFuncEnd(fva):
-            shift_count += 1
-            if idc.GetMnem(cva) in shift_mnems:
+            i = idc.GetMnem(cva)
+            if i in shift_mnems:
+                found_shifts.add(i)
                 g_logger.debug("shift instruction: %s va: 0x%x function: 0x%x", idc.GetDisasm(cva), cva, fva)
             cva = idc.NextHead(cva)
-        candidate_functions[fva] = 1 - ((shift_mnems_len - shift_count) / shift_mnems_len)
+        candidate_functions[fva] = 1 - ((shift_mnems_len - len(found_shifts)) / float(shift_mnems_len))
     return candidate_functions
+
+
+def find_tight_loops(fva):
+    """ Code from Willi Ballenthin """
+    tight_loops = []
+    function = idaapi.get_func(fva)
+    for bb in idaapi.FlowChart(function):
+        # bb.endEA is the first addr not in the basic block
+        bb_end = idc.PrevHead(bb.endEA)
+        for x in idautils.XrefsFrom(bb_end):
+            if x.to == bb.startEA and bb.startEA < bb_end:
+                tight_loops.append((bb.startEA, bb_end))
+    if tight_loops:
+        g_logger.debug("Tight loops in 0x%x: %s", fva, ["0x%x - 0x%x" % (s, e) for (s, e) in tight_loops])
+    return tight_loops
 
 
 def find_suspicous_movs(functions):
     candidate_functions = []
+    regs = ["esp", "ebp", "rsp", "rbp"]
     for fva in functions:
-        cva = fva
-        while cva != idaapi.BADADDR and cva < idc.FindFuncEnd(fva):  # idc.GetFunctionAttr
-            if idc.GetMnem(cva) == "mov":
-                # identify register dereferenced writes to memory, e.g. mov [eax], cl
-                if idc.GetOpType(cva, 0) == OP_TYPE.BASE_INDEX.value:
-                    if idc.GetOpType(cva, 1) not in [OP_TYPE.IMMEDIATE.value, OP_TYPE.IMMEDIATE_FAR.value,
-                                                     OP_TYPE.IMMEDIATE_NEAR.value]:
-                        g_logger.debug("suspicious MOV instruction at 0x%08X in function 0x%08X: %s", cva, fva,
-                                       idc.GetDisasm(cva))
-                        candidate_functions.append(fva)
-                        break
-            cva = idc.NextHead(cva)
+        for (loopStart, loopEnd) in find_tight_loops(fva):
+            cva = loopStart
+            while cva <= loopEnd:
+                if idc.GetMnem(cva) == "mov":
+                    if is_list_item_in_s(regs, idc.GetOpnd(cva, 0)):
+                        cva = idc.NextHead(cva)
+                        continue
+                    # identify register dereferenced writes to memory, e.g. mov [eax], cl
+                    if idc.GetOpType(cva, 0) == OP_TYPE.BASE_INDEX.value:
+                        if idc.GetOpType(cva, 1) not in [OP_TYPE.IMMEDIATE.value, OP_TYPE.IMMEDIATE_FAR.value,
+                                                         OP_TYPE.IMMEDIATE_NEAR.value]:
+                            g_logger.debug("suspicious MOV instruction at 0x%08X in function 0x%08X: %s", cva, fva,
+                                           idc.GetDisasm(cva))
+                            candidate_functions.append(fva)
+                            break
+                cva = idc.NextHead(cva)
     return candidate_functions
+
+
+def is_list_item_in_s(l, s):
+    for e in l:
+        if e in s:
+            return True
+    return False
 
 
 def apply_weights(user_functions_sorted, candidates_xor, candidates_shift, candidates_mov):
@@ -134,17 +165,20 @@ def apply_weights(user_functions_sorted, candidates_xor, candidates_shift, candi
 
     weighted_functions = {}
     max_xrefs = user_functions_sorted[0][1]
+
     for fva, xrefs in user_functions_sorted:
-        weighted_functions[fva] = XREF_WEIGHT * (xrefs / max_xrefs)
+        score = XREF_WEIGHT * (float(xrefs) / float(max_xrefs))
+        weighted_functions[fva] = score
 
-    for fva in candidates_xor:
-        weighted_functions[fva] += XOR_WEIGHT
+        if fva in candidates_xor:
+            weighted_functions[fva] += XOR_WEIGHT
 
-    for fva, score in candidates_shift.iteritems():
-        weighted_functions[fva] += SHIFT_WEIGHT * score
+        if fva in candidates_shift:
+            score = candidates_shift[fva]
+            weighted_functions[fva] += SHIFT_WEIGHT * score
 
-    for fva in candidates_mov:
-        weighted_functions[fva] += MOV_WEIGHT
+        if fva in candidates_mov:
+            weighted_functions[fva] += MOV_WEIGHT
 
     return weighted_functions
 
